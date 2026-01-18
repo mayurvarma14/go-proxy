@@ -1,0 +1,99 @@
+listeners:
+  - name: http_main
+    address: 0.0.0.0:8080
+    filter_chains:
+      - name: basic
+        filters: ["logging", "hcm"]
+  - name: https_main
+    address: 0.0.0.0:8443
+    tls:
+      cert_path: ./server.crt
+      key_path: ./server.key
+      min_version: "1.2"
+    filter_chains:
+      # Default chain (no SNI match): omit network logging for a visible difference
+      - name: default
+        filters: ["hcm"]
+      # SNI-matched chain: includes network logging
+      - name: sni_app
+        sni_hosts: ["app.example.com"]
+        filters: ["logging", "hcm"]
+
+routes:
+  - prefix: /svc1
+    cluster: service1
+    prefix_rewrite: /
+  - prefix: /svc-dns
+    cluster: dns_svc
+    prefix_rewrite: /
+  - prefix: /
+    cluster: default
+    strip_prefix: true
+
+rate_limit:
+  rps: 1000
+  burst: 1000
+  scope: global
+
+clusters:
+  - name: dns_svc
+    endpoints: ["localhost:9004"]
+    discovery: strict_dns
+    dns_refresh_seconds: 5
+    circuit_breaker:
+      max_requests: 50
+      max_pending: 1000
+      per_endpoint_max_requests: 100
+    retry_policy:
+      request_timeout_ms: 3000
+      per_try_timeout_ms: 1200
+      max_retries: 1
+      idempotent_only: true
+      backoff_base_ms: 100
+      backoff_max_ms: 500
+    health_check:
+      type: http
+      http_path: /
+      interval_ms: 1000
+      timeout_ms: 500
+      healthy_threshold: 1
+      unhealthy_threshold: 2
+    lb_policy: round_robin
+
+  - name: service1
+    endpoints: ["127.0.0.1:9001", "127.0.0.1:9002"]
+    retry_policy:
+      request_timeout_ms: 3000
+      per_try_timeout_ms: 1200
+      max_retries: 1
+      idempotent_only: true
+      backoff_base_ms: 100
+      backoff_max_ms: 500
+    health_check:
+      type: http
+      http_path: /
+      interval_ms: 2000
+      timeout_ms: 800
+      healthy_threshold: 1
+      unhealthy_threshold: 2
+    outlier:
+      consecutive_failures: 3
+      ejection_seconds: 30
+    circuit_breaker:
+      max_requests: 5
+    lb_policy: least_requests
+
+  - name: default
+    endpoints: ["127.0.0.1:9003"]
+    retry_policy:
+      request_timeout_ms: 3000
+      per_try_timeout_ms: 1200
+      max_retries: 0
+    health_check:
+      type: http
+      http_path: /
+      interval_ms: 2000
+      timeout_ms: 800
+    circuit_breaker:
+      max_requests: 50
+    lb_policy: round_robin
