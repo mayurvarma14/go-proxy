@@ -39,6 +39,25 @@ Users → Go-Proxy → Backend Services
 
 ---
 
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [System Architecture](#system-architecture)
+- [Request Processing Pipeline](#request-processing-pipeline)
+- [Configuration](#configuration)
+- [Load Balancing](#load-balancing)
+- [Resilience Patterns](#resilience-patterns)
+- [Rate Limiting](#rate-limiting)
+- [TLS & Security](#tls--security)
+- [Service Discovery](#service-discovery)
+- [Observability](#observability)
+- [Testing Examples](#testing-examples)
+- [Project Structure](#project-structure)
+- [Summary](#summary)
+- [Further Learning](#further-learning)
+
+---
+
 ## Quick Start
 
 ### Prerequisites
