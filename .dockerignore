@@ -1,0 +1,10 @@
+.git
+.github
+bin/
+dist/
+images/
+*.md
+*.crt
+*.key
+*.pem
+coverage.out

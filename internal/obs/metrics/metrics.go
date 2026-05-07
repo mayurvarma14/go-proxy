@@ -60,35 +60,45 @@ func SetGauge(name string, v int64) {
 // into a fixed-bucket histogram. Buckets are cumulative and follow Prometheus
 // conventions when rendered.
 func ObserveUpstreamLatencyMs(cluster string, ms int64) {
-    if ms < 0 { ms = 0 }
-    // Fixed buckets (ms)
-    buckets := []int64{5, 10, 25, 50, 100, 200, 500, 1000, 2000, 5000}
-    for _, b := range buckets {
-        if ms <= b {
-            Add("hist.upstream_request_duration_ms."+cluster+".bucket."+strconv.FormatInt(b, 10), 1)
-        }
-    }
-    // +Inf bucket (always increment)
-    Add("hist.upstream_request_duration_ms."+cluster+".bucket.Inf", 1)
-    // Sum and count
-    Add("hist.upstream_request_duration_ms."+cluster+".count", 1)
-    Add("hist.upstream_request_duration_ms."+cluster+".sum", ms)
+	if ms < 0 {
+		ms = 0
+	}
+	// Fixed buckets (ms)
+	buckets := []int64{5, 10, 25, 50, 100, 200, 500, 1000, 2000, 5000}
+	for _, b := range buckets {
+		if ms <= b {
+			Add("hist.upstream_request_duration_ms."+cluster+".bucket."+strconv.FormatInt(b, 10), 1)
+		}
+	}
+	// +Inf bucket (always increment)
+	Add("hist.upstream_request_duration_ms."+cluster+".bucket.Inf", 1)
+	// Sum and count
+	Add("hist.upstream_request_duration_ms."+cluster+".count", 1)
+	Add("hist.upstream_request_duration_ms."+cluster+".sum", ms)
 }
 
 // IncDownstreamRequest increments a labeled downstream request counter.
 // Labels: method, cluster (cluster may be empty if no route matched).
 func IncDownstreamRequest(method, cluster string) {
-    if method == "" { method = "UNKNOWN" }
-    if cluster == "" { cluster = "none" }
-    Add("downstream_http_requests_total.method."+strings.ToUpper(method)+".cluster."+cluster, 1)
+	if method == "" {
+		method = "UNKNOWN"
+	}
+	if cluster == "" {
+		cluster = "none"
+	}
+	Add("downstream_http_requests_total.method."+strings.ToUpper(method)+".cluster."+cluster, 1)
 }
 
 // IncUpstreamOutcome increments labeled upstream request outcomes.
 // outcome: success | timeout | error
 func IncUpstreamOutcome(cluster, outcome string) {
-    if cluster == "" { cluster = "none" }
-    if outcome == "" { outcome = "unknown" }
-    Add("upstream_requests_total.cluster."+cluster+".outcome."+outcome, 1)
+	if cluster == "" {
+		cluster = "none"
+	}
+	if outcome == "" {
+		outcome = "unknown"
+	}
+	Add("upstream_requests_total.cluster."+cluster+".outcome."+outcome, 1)
 }
 
 // IncCode bumps response counters for total and code class (2xx, 4xx, 5xx).

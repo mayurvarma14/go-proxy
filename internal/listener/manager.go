@@ -48,7 +48,7 @@ func (m *Manager) Start(ctx context.Context) error {
 // StopAccept stops all listeners from accepting new connections. Existing
 // connections continue until they complete.
 func (m *Manager) StopAccept() {
-    for _, l := range m.listeners {
-        l.StopAccept()
-    }
+	for _, l := range m.listeners {
+		l.StopAccept()
+	}
 }

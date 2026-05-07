@@ -1,189 +1,169 @@
-# Go-Proxy
+# go-proxy
 
-> **A production-grade HTTP/HTTPS reverse proxy and load balancer built in Go**  
-> Learn how systems like Envoy, NGINX, and HAProxy work under the hood
+A small reverse proxy / L7 load balancer written in Go. Built to work through
+the data-plane patterns I kept seeing in Envoy and NGINX — listener/filter
+chains, cluster-based upstream management, active + passive health checking,
+circuit breaking, retry budgets — and to have something I could actually run
+locally and poke at.
 
----
+This is a learning project, not a drop-in replacement for anything. If you
+need a real proxy, use Envoy. If you want to read ~3.5k lines of Go that
+implements the same shape end-to-end, this might be useful.
 
-## What is Go-Proxy?
+## Contents
 
-Go-Proxy is a **learning-focused implementation** of a modern reverse proxy that demonstrates real-world distributed systems patterns. Think of it as a traffic cop that sits between your users and your backend services:
-
-```
-Users → Go-Proxy → Backend Services
-```
-
-**Why use a reverse proxy?**
-
-- **Load balancing** — distribute traffic across multiple servers
-- **Security** — TLS termination, hide backend topology
-- **Resilience** — circuit breakers, retries, health checks
-- **Observability** — unified metrics and logging
-
-### Core Capabilities
-
-| Feature | Description |
-|---------|-------------|
-| ✅ Multi-listener support | HTTP/HTTPS on different ports |
-| ✅ TLS termination | With SNI and optional mTLS |
-| ✅ HTTP/1.1 and HTTP/2 | Full protocol support |
-| ✅ Load balancing | Round Robin, Random, Least Requests |
-| ✅ Circuit breaking | Concurrency limits with fast-fail |
-| ✅ Health checking | Active (HTTP/TCP) and passive (outlier detection) |
-| ✅ Rate limiting | Token bucket (global and per-IP) |
-| ✅ Request routing | Path matching with rewriting |
-| ✅ Retry policies | Exponential backoff with jitter |
-| ✅ Hot reload | Update config without dropping connections |
-| ✅ Observability | Prometheus metrics, access logs |
-| ✅ Service discovery | DNS-based (strict DNS) |
-
----
-
-## Table of Contents
-
-- [Quick Start](#quick-start)
-- [System Architecture](#system-architecture)
-- [Request Processing Pipeline](#request-processing-pipeline)
+- [Quick start](#quick-start)
+- [What it does](#what-it-does)
+- [What it doesn't do](#what-it-doesnt-do)
+- [Architecture](#architecture)
 - [Configuration](#configuration)
-- [Load Balancing](#load-balancing)
-- [Resilience Patterns](#resilience-patterns)
-- [Rate Limiting](#rate-limiting)
-- [TLS & Security](#tls--security)
-- [Service Discovery](#service-discovery)
-- [Observability](#observability)
-- [Testing Examples](#testing-examples)
-- [Project Structure](#project-structure)
-- [Summary](#summary)
-- [Further Learning](#further-learning)
+- [Operations](#operations)
+- [Design notes](#design-notes)
+- [Layout](#layout)
+- [Testing it locally](#testing-it-locally)
 
----
+## Quick start
 
-## Quick Start
+Requires Go 1.24+ and `openssl` for the dev TLS cert.
 
-### Prerequisites
-
-- [Go](https://go.dev/) 1.21 or higher
-
-### Run the Proxy
-
-```bash
-# Clone the repository
+```sh
 git clone https://github.com/mayurvarma14/go-proxy.git
 cd go-proxy
-
-# Generate self-signed TLS certificate (required for HTTPS)
-openssl req -x509 -newkey rsa:4096 -keyout server.key -out server.crt \
-  -days 365 -nodes -subj "/CN=localhost"
-
-# Run with default config
-go run cmd/proxy/main.go --config config/dev.yaml
+make certs           # generates self-signed server.crt / server.key for localhost
+make run             # builds and runs with config/dev.yaml
 ```
 
-The proxy starts with:
+Defaults from `config/dev.yaml`:
 
-- **HTTP Listener**: Port `8080`
-- **HTTPS Listener**: Port `8443`
-- **Admin Server**: Port `9901`
+| Port | What |
+|------|------|
+| 8080 | HTTP listener |
+| 8443 | HTTPS listener (SNI-aware filter chains) |
+| 9901 | Admin server (`/healthz`, `/metrics`, `/config`, `/reload`, ...) |
 
-### Verify It Works
+A small echo server is included for end-to-end testing:
 
-```bash
-# Check health
-curl localhost:9901/healthz
-# Output: ok
-
-# Start a test backend
-python3 -m http.server 9003 &
-
-# Make a request through the proxy
-curl -v localhost:8080/
+```sh
+go run ./cmd/echo --addr 127.0.0.1:9001 &
+go run ./cmd/echo --addr 127.0.0.1:9002 &
+go run ./cmd/echo --addr 127.0.0.1:9003 &
+curl localhost:8080/svc1/   # round-trips through the proxy to 9001/9002
 ```
 
----
+Docker:
 
-## System Architecture
+```sh
+make docker
+docker run --rm -p 8080:8080 -p 9901:9901 go-proxy:latest
+```
 
-![Architecture Overview](./images/architecture.png)
+## What it does
 
-Go-Proxy follows a **layered architecture** where each layer has a specific responsibility:
+- Multi-listener HTTP/1.1 and HTTPS with TLS termination, SNI-based filter
+  chain selection, optional mTLS.
+- Path-prefix routing with prefix strip / rewrite, host rewrite, header
+  add/remove, per-route retry overrides.
+- Three load balancing policies: round robin (default), random, least
+  requests. All skip endpoints marked unhealthy by either active checks or
+  outlier detection.
+- Active health checks (HTTP or TCP) with configurable thresholds, run as
+  per-endpoint goroutines.
+- Passive outlier detection: N consecutive failures ⇒ eject for T seconds.
+- Two circuit breakers per cluster: cluster-wide concurrent in-flight cap and
+  per-endpoint concurrent cap. Optional bounded pending queue with 504 when
+  the queue or request context times out.
+- Retry policy with exponential backoff + jitter, idempotent-only by default,
+  per-try and overall request timeouts.
+- Token-bucket rate limit, global or per-client-IP.
+- Strict DNS service discovery: hostnames in a cluster's endpoint list are
+  re-resolved on an interval and the endpoint set is swapped atomically.
+- Hot reload via `POST /reload` — config is re-parsed and listeners that
+  changed are restarted; clusters are rebuilt without dropping in-flight
+  requests on unchanged clusters.
+- Prometheus exposition at `/metrics` plus a human-readable text dump at
+  `/stats`.
+- Graceful shutdown / drain: `POST /drain_start` stops accepting new
+  connections, `/quitquitquit` cancels the root context.
 
-### High-Level Components
+## What it doesn't do
 
-#### 1. Listener Manager
+Worth being honest about — these are the edges I hit and chose not to cross:
 
-- Accepts incoming TCP connections on configured ports
-- Handles TLS termination for HTTPS traffic
-- Routes connections through filter chains
-- Supports graceful shutdown and connection draining
+- **HTTP/2 downstream is partial.** There's an h2 handler but it doesn't get
+  the full filter pipeline; production-quality h2 would mean a real connection
+  manager that owns the stream lifecycle. HTTP/2 *upstream* is enabled when a
+  cluster uses TLS and ALPN negotiates h2.
+- **No gRPC-aware routing.** Headers/methods only.
+- **Wildcard SNI is not supported.** Exact match only.
+- **No xDS, no control plane.** Static YAML/JSON, with a manual `/reload`
+  hook. Adding something like a file watcher is a few lines; an actual xDS
+  client is not.
+- **Discovery is DNS only.** No EDS, no Consul/etcd integration.
+- **No request/response body transforms** beyond the headers and path
+  rewrites listed above.
+- **Metrics are an in-process counter map.** Good enough for portfolio /
+  local use; for real workloads you'd swap in `prometheus/client_golang`
+  with proper labeled metrics.
 
-#### 2. Filter Chains
+## Architecture
 
-- **Network Layer**: Processes raw TCP connections
-- **HTTP Layer**: Parses HTTP requests and applies filters:
-  - Logging Filter
-  - Forwarded Headers (X-Forwarded-*)
-  - Rate Limiting
-  - Router (path matching)
-  - Upstream Proxy (forwarding)
+Roughly mirrors Envoy's vocabulary but at a much smaller scale.
 
-#### 3. Cluster Manager
+```
+                                 ┌────────────────────────────┐
+                                 │     Admin (:9901)          │
+                                 │  /healthz /metrics /config │
+                                 │  /reload  /drain_start     │
+                                 │  /endpoints /quitquitquit  │
+                                 └─────────────▲──────────────┘
+                                               │
+   downstream                                  │
+   ───────────►  Listener  ──►  Filter chain ──┴──►  HCM  ──►  Router  ──►  Upstream
+                 (TCP+TLS)      (network)            (HTTP)    (prefix)     (cluster
+                 SNI-routed     logging,             access     match,       client +
+                                forwarded,           log,       rewrite,     retry +
+                                rate-limit,          h1/h2      override     CB +
+                                ...                                          LB pick)
+                                                                                │
+                                                                                ▼
+                                                                       ┌──────────────┐
+                                                                       │   Cluster    │
+                                                                       │              │
+                                                                       │  endpoints   │
+                                                                       │  + active HC │
+                                                                       │  + outlier   │
+                                                                       │  + CB        │
+                                                                       │  + DNS disco │
+                                                                       └──────────────┘
+```
 
-- Manages pools of upstream endpoints (clusters)
-- Implements load balancing policies
-- Tracks endpoint health (active and passive)
-- Enforces circuit breakers
-- Handles service discovery
+The pre-rendered diagrams in `images/` cover the same flow plus details for
+load balancing, circuit breaker states, the TLS handshake, and DNS resolution
+loops.
 
-#### 4. Admin Server (:9901)
+### Request lifecycle
 
-| Endpoint | Description |
-|----------|-------------|
-| `/healthz` | Health check |
-| `/stats` | Human-readable metrics |
-| `/metrics` | Prometheus format |
-| `/config` | Current configuration |
-| `/reload` | Hot reload trigger (POST) |
-| `/endpoints` | Endpoint health status |
-
----
-
-## Request Processing Pipeline
-
-Every request flows through 7 distinct stages:
-
-![Request Flow](./images/request_flow.png)
-
-### Step-by-Step Flow
-
-| Step | What Happens |
-|------|--------------|
-| **1. Connection** | Listener accepts TCP connection |
-| **2. TLS** | TLS handshake, extract SNI hostname |
-| **3. Filters** | HTTP filter chain: logging → rate limit → router |
-| **4. Circuit Breaker** | Check cluster capacity (503 if full) |
-| **5. Load Balancer** | Pick healthy endpoint |
-| **6. Upstream** | Forward request to backend |
-| **7. Response** | Stream response back, handle retries on failure |
-
-### Filter Chain Details
-
-| Filter | Purpose |
-|--------|---------|
-| **Logging** | Log request details |
-| **Forwarded Headers** | Add X-Forwarded-For, X-Forwarded-Proto, Via, X-Request-ID |
-| **Rate Limiter** | Check token bucket → 429 if limited |
-| **Router** | Match path → set cluster, compute rewrite |
-| **Upstream Proxy** | Forward to backend |
-
----
+1. Listener accepts a TCP conn. For HTTPS, completes the TLS handshake; the
+   selected filter chain is the one whose `sni_hosts` matches the client's
+   SNI (or the first chain with no `sni_hosts` as the default).
+2. Network filters run in order on the connection. The terminal filter is
+   the HCM (HTTP connection manager).
+3. The HCM parses HTTP requests (h1 today; h2 hooks are wired but not the
+   full filter chain) and runs HTTP filters: forwarded headers → rate limit
+   → router → upstream proxy.
+4. Router picks a cluster by longest-matching prefix and computes the
+   rewritten path / route options.
+5. Upstream proxy tries up to `1 + max_retries` attempts: acquire cluster CB
+   capacity, pick an endpoint via the LB policy (skipping unhealthy and
+   per-endpoint-saturated endpoints), forward with a per-try timeout, on
+   failure mark the endpoint and back off.
+6. Response is streamed back to the downstream connection.
 
 ## Configuration
 
-Go-Proxy uses YAML or JSON configuration. The config has three main sections:
-
-### Listeners
-
-Define where the proxy accepts connections:
+YAML and JSON are both accepted; the loader picks based on file extension.
+The schema lives in `internal/config/types.go` — that is the source of
+truth. The example below covers the common knobs.
 
 ```yaml
 listeners:
@@ -191,448 +171,179 @@ listeners:
     address: 0.0.0.0:8080
     filter_chains:
       - name: basic
-        filters: ["logging", "hcm"]
-        
+        filters: [logging, hcm]
+
   - name: https_main
     address: 0.0.0.0:8443
     tls:
       cert_path: ./server.crt
       key_path: ./server.key
       min_version: "1.2"
+      # client_ca_path / require_client_cert for mTLS
     filter_chains:
       - name: default
-        filters: ["hcm"]
-      - name: sni_app
-        sni_hosts: ["app.example.com"]
-        filters: ["logging", "hcm"]
-```
+        filters: [hcm]
+      - name: app
+        sni_hosts: [app.example.com]
+        filters: [logging, hcm]
 
-### Routes
-
-Map URL paths to backend clusters:
-
-```yaml
 routes:
   - prefix: /svc1
     cluster: service1
     prefix_rewrite: /
-    
-  - prefix: /svc-dns
-    cluster: dns_svc
-    prefix_rewrite: /
-    
   - prefix: /
     cluster: default
     strip_prefix: true
-```
 
-### Clusters
+rate_limit:
+  rps: 1000
+  burst: 1000
+  scope: global   # or "ip"
 
-Define backend services and their behavior:
-
-```yaml
 clusters:
   - name: service1
-    endpoints: ["127.0.0.1:9001", "127.0.0.1:9002"]
+    endpoints: [127.0.0.1:9001, 127.0.0.1:9002]
     lb_policy: least_requests
-    
-    circuit_breaker:
-      max_requests: 5
-      
     health_check:
       type: http
       http_path: /
       interval_ms: 2000
+      timeout_ms: 800
       healthy_threshold: 1
       unhealthy_threshold: 2
-      
     outlier:
       consecutive_failures: 3
       ejection_seconds: 30
-      
+    circuit_breaker:
+      max_requests: 50
+      max_pending: 1000              # bounded wait queue; 0 = fast-fail
+      per_endpoint_max_requests: 100
     retry_policy:
-      max_retries: 1
+      request_timeout_ms: 3000
       per_try_timeout_ms: 1200
+      max_retries: 1
       idempotent_only: true
       backoff_base_ms: 100
       backoff_max_ms: 500
-```
 
----
-
-## Load Balancing
-
-Go-Proxy supports three load balancing algorithms:
-
-![Load Balancing Algorithms](./images/load_balancing.png)
-
-### Algorithms Comparison
-
-| Algorithm | How It Works | Best For |
-|-----------|--------------|----------|
-| **Round Robin** | Cycle: A → B → C → A... | Homogeneous backends |
-| **Random** | Pick randomly from healthy | Large pools, stateless |
-| **Least Requests** | Pick endpoint with fewest in-flight | Variable response times |
-
-### Round Robin
-
-```
-Requests:  1  2  3  4  5  6  7  8  9
-Endpoints: A  B  C  A  B  C  A  B  C
-```
-
-### Random
-
-```
-10 picks: B C B A B A C C A B
-Distribution: A=3, B=4, C=3 (some variance expected)
-```
-
-### Least Requests
-
-```
-Current in-flight: A=1, B=1, C=5
-Next request → pick A or B (lowest)
-```
-
-**Key insight**: All policies automatically skip unhealthy endpoints.
-
----
-
-## Resilience Patterns
-
-### Circuit Breakers
-
-**Purpose**: Protect backends from overload by limiting concurrent requests.
-
-![Circuit Breaker Flow](./images/circuit_breaker.png)
-
-**How it works**:
-
-| Condition | Action |
-|-----------|--------|
-| in-flight < max_requests | Proceed |
-| in-flight ≥ max_requests | Return 503 immediately |
-
-**Configuration**:
-
-```yaml
-circuit_breaker:
-  max_requests: 50        # Cluster-level limit
-  per_endpoint_max_requests: 100  # Per-endpoint limit
-```
-
-**Tuning formula**:
-
-```
-max_requests ≈ target_RPS × average_latency_seconds
-Example: 200 RPS × 0.1s = 20 concurrent requests
-```
-
-### Health Checking
-
-![Health Checking](./images/health_checking.png)
-
-#### Active Health Checks
-
-The proxy periodically probes each endpoint:
-
-```yaml
-health_check:
-  type: http           # or "tcp"
-  http_path: /health
-  interval_ms: 2000    # Check every 2 seconds
-  timeout_ms: 800
-  healthy_threshold: 1   # 1 success → mark healthy
-  unhealthy_threshold: 2 # 2 failures → mark unhealthy
-```
-
-- **HTTP**: Success if status < 500
-- **TCP**: Success if connection established
-
-#### Passive Health (Outlier Detection)
-
-Monitors actual request failures and automatically ejects consistently failing endpoints:
-
-```yaml
-outlier:
-  consecutive_failures: 3   # 3 failures in a row → eject
-  ejection_seconds: 30      # Auto-recover after 30s
-```
-
-### Retry Policies
-
-Automatically retry failed requests:
-
-```yaml
-retry_policy:
-  max_retries: 1
-  per_try_timeout_ms: 1200
-  idempotent_only: true       # Only retry GET/HEAD/etc
-  backoff_base_ms: 100
-  backoff_max_ms: 500
-```
-
-**Backoff formula**: `wait = min(base × 2^attempt + jitter, max)`
-
----
-
-## Rate Limiting
-
-Go-Proxy uses the **token bucket** algorithm for rate limiting:
-
-![Rate Limiting](./images/rate_limiting.png)
-
-### How Token Bucket Works
-
-| Parameter | Description |
-|-----------|-------------|
-| `rps` | Tokens refilled per second |
-| `burst` | Maximum bucket capacity |
-| `scope` | `global` or `ip` |
-
-**Logic**:
-
-```
-if tokens >= 1:
-    tokens -= 1 → ALLOW
-else:
-    → DENY with 429 Too Many Requests
-```
-
-### Configuration
-
-```yaml
-rate_limit:
-  rps: 1000      # Steady-state rate
-  burst: 1000    # Allow short bursts
-  scope: global  # or "ip" for per-client limiting
-```
-
-### Timeline Example
-
-**Config**: `rps=5, burst=10`
-
-| Time | Bucket | Arrivals | Allowed | Denied |
-|------|--------|----------|---------|--------|
-| 0.00s | 10 | 12 | 10 | 2 |
-| 0.20s | 1 | 1 | 1 | 0 |
-| 1.00s | 5 | 4 | 4 | 0 |
-| 2.00s | 6 | 9 | 6 | 3 |
-
----
-
-## TLS & Security
-
-![TLS Handshake](./images/tls_handshake.png)
-
-### TLS Guarantees
-
-| Promise | Meaning |
-|---------|---------|
-| **Confidentiality** | Data is encrypted |
-| **Integrity** | Data is tamper-evident |
-| **Authenticity** | Server identity verified |
-
-### TLS 1.3 Handshake Steps
-
-1. **ClientHello**: TLS version, ciphers, SNI, ALPN
-2. **ServerHello + Certificate**: Selected cipher, server cert
-3. **Key Exchange**: Ephemeral Diffie-Hellman → shared secret
-4. **Finished**: Both confirm same key
-5. **Application Data**: Encrypted HTTP
-
-### Configuration Examples
-
-**Basic HTTPS**:
-
-```yaml
-tls:
-  cert_path: ./server.crt
-  key_path: ./server.key
-  min_version: "1.2"
-```
-
-**SNI-Based Routing**:
-
-```yaml
-filter_chains:
-  - name: app_chain
-    sni_hosts: ["app.example.com"]
-    filters: ["logging", "hcm"]
-```
-
-**Mutual TLS (mTLS)**:
-
-```yaml
-tls:
-  client_ca_path: ./client-ca.pem
-  require_client_cert: true
-```
-
----
-
-## Service Discovery
-
-Go-Proxy supports **Strict DNS** discovery for dynamically resolving backend endpoints:
-
-![Service Discovery](./images/service_discovery.png)
-
-### How It Works
-
-1. Configure cluster with hostname (not IP)
-2. Proxy periodically resolves DNS (A/AAAA records)
-3. Updates endpoint set atomically
-4. Starts/stops health checks automatically
-
-### Configuration
-
-```yaml
-clusters:
   - name: dns_svc
-    endpoints: ["api.internal:9000"]
+    endpoints: [api.internal:9000]   # hostname → resolved every dns_refresh_seconds
     discovery: strict_dns
     dns_refresh_seconds: 5
 ```
 
-### DNS Resolution Example
+## Operations
+
+The admin server is intentionally tiny:
+
+| Endpoint        | Method  | Purpose                                |
+|-----------------|---------|----------------------------------------|
+| `/healthz`      | GET     | Liveness                               |
+| `/metrics`      | GET     | Prometheus exposition                  |
+| `/stats`        | GET     | Same numbers, plain text               |
+| `/config`       | GET     | Effective config snapshot              |
+| `/routes`       | GET     | Current route rules                    |
+| `/endpoints`    | GET     | Per-endpoint health and in-flight      |
+| `/reload`       | POST    | Re-read config file, restart listeners |
+| `/drain_start`  | POST    | Stop accepting new downstream conns    |
+| `/quitquitquit` | POST    | Graceful shutdown                      |
+
+A few selected metrics (full list in `internal/obs/metrics`):
 
 ```
-Every 5 seconds:
-Query: A api.internal
-Response: [10.0.1.5, 10.0.1.8, 10.0.2.3]
-Result: [10.0.1.5:9000, 10.0.1.8:9000, 10.0.2.3:9000]
+downstream_http_requests_total
+http_responses_2xx_total / 4xx_total / 5xx_total
+upstream_attempts_total
+upstream_failures_total
+upstream_outcome_total{cluster,outcome=success|error|timeout}
+upstream_latency_ms{cluster} (histogram)
+cluster_inflight_requests{cluster}
+endpoint_inflight_requests{cluster,endpoint}
+endpoints_ejected_total
+endpoints_added_total / endpoints_removed_total
+circuit_breaker_open_total / circuit_breaker_trips_total
+pending_dropped_total
+rate_limit_dropped_total
+dns_resolve_total / dns_resolve_errors_total
 ```
 
----
+## Design notes
 
-## Observability
+A few choices that aren't obvious from the code:
 
-### Prometheus Metrics (`/metrics`)
+- **Endpoints are addressed by string.** No `Endpoint` interface, no
+  per-endpoint subobject. State is keyed by `host:port` strings under a
+  single `sync.RWMutex` per cluster. Cheap, easy to reason about, and the
+  hot path uses atomics for in-flight counters so the lock is only taken
+  when state actually changes.
+- **Per-endpoint goroutines for health checks.** Adding/removing endpoints
+  starts/stops a goroutine. For O(10) endpoints per cluster this is fine; if
+  you scaled to thousands you'd batch checks instead.
+- **Strict-DNS resolves the union of all seed hostnames** plus any
+  IP-literal seeds. Atomic swap of the endpoint slice avoids needing a
+  CoW data structure.
+- **`MaxRequests` is enforced by an atomic add/rollback**, not a semaphore.
+  Slightly faster, slightly looser (you can exceed the cap by 1 transiently
+  when the limit is hit). For a learning project, fine; for production I'd
+  use a semaphore + benchmarks.
+- **Retries are bounded by request context.** A retry will not start past
+  the overall `request_timeout_ms`, and `per_try_timeout_ms` bounds each
+  attempt. Backoff is exponential with up to 25% jitter.
+- **TLS 1.2 is the default minimum.** 1.3 is supported with `min_version:
+  "1.3"`. Cipher suites are Go's defaults.
+- **The HCM is HTTP/1.1-first.** There is an h2 path, but the filter chain
+  is best exercised on h1 right now.
 
-| Metric | Type | Description |
-|--------|------|-------------|
-| `downstream_http_requests_total` | Counter | Total requests |
-| `http_responses_*_total` | Counter | Responses by status |
-| `cluster_inflight_requests` | Gauge | In-flight per cluster |
-| `circuit_breaker_trips_total` | Counter | CB rejections |
-| `endpoints_ejected_total` | Counter | Outlier ejections |
-| `rate_limit_dropped_total` | Counter | Rate limited |
-| `dns_resolve_total` | Counter | DNS lookups |
-
-### Admin Endpoints
-
-```bash
-curl http://127.0.0.1:9901/healthz      # Health check
-curl http://127.0.0.1:9901/stats        # Human-readable stats
-curl http://127.0.0.1:9901/metrics      # Prometheus format
-curl http://127.0.0.1:9901/config       # Current config
-curl http://127.0.0.1:9901/endpoints    # Endpoint health status
-curl -X POST http://127.0.0.1:9901/reload  # Hot reload
-```
-
----
-
-## Testing Examples
-
-### Start Test Backends
-
-```bash
-# Start multiple backends on different ports
-python3 -m http.server 9001 &
-python3 -m http.server 9002 &
-python3 -m http.server 9003 &
-```
-
-### Basic Tests
-
-```bash
-# HTTP request
-curl http://localhost:8080/
-
-# HTTPS (self-signed cert)
-curl -k https://localhost:8443/
-
-# Specific route
-curl http://localhost:8080/svc1/
-```
-
-### Load Testing
-
-```bash
-# Parallel burst (10 concurrent requests)
-seq 100 | xargs -P 10 -n1 -I{} curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/
-
-# Circuit breaker test (30 concurrent to trigger limit)
-seq 50 | xargs -P 30 -n1 -I{} curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/ | sort | uniq -c
-
-# Rate limit test (rapid fire)
-for i in $(seq 1 50); do curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/; done | sort | uniq -c
-```
-
-### Hot Reload
-
-```bash
-# Edit config/dev.yaml, then trigger reload
-curl -X POST http://127.0.0.1:9901/reload
-```
-
----
-
-## Project Structure
+## Layout
 
 ```
-go-proxy/
-├── cmd/proxy/          # Main entry point
-│   └── main.go
-├── config/             # Configuration files
-│   ├── dev.yaml
-│   └── dev.json
-├── internal/
-│   ├── admin/          # Admin server (:9901)
-│   ├── cluster/        # Cluster manager, load balancing, health
-│   ├── config/         # Configuration parsing
-│   ├── connctx/        # Connection context
-│   ├── filter/         # Network filter interface
-│   ├── httpcm/         # HTTP Connection Manager, router, upstream
-│   ├── listener/       # TCP/TLS listener
-│   ├── obs/            # Observability (metrics, access logs)
-│   └── runtime/        # Supervisor, lifecycle
-├── server.crt          # Self-signed TLS cert (dev)
-├── server.key          # TLS private key (dev)
-└── README.md           # This file
+cmd/
+  proxy/         # main binary
+  echo/          # tiny upstream for E2E tests
+config/          # dev.yaml, dev.json
+internal/
+  admin/         # admin HTTP server
+  cluster/       # endpoints, LB, health, outlier, DNS, CB
+  config/        # types + load + validate
+  connctx/       # per-conn metadata
+  filter/        # network filter interface
+  httpcm/        # HTTP connection manager + filters + router + upstream
+  listener/      # TCP/TLS listener + chain selection
+  obs/
+    accesslog/
+    metrics/
+  runtime/
+    supervisor/  # owns lifecycle, drives /reload
+  integration/   # smoke tests
+images/          # rendered architecture diagrams
 ```
 
----
+## Testing it locally
 
-## Summary
+```sh
+make test                           # race + count=1
+make cover                          # coverage summary
+make bench                          # benchmarks (currently sparse)
+go test ./internal/cluster -run TestOutlier -v
+```
 
-Go-Proxy demonstrates how modern reverse proxies work:
+A handful of useful one-liners while a proxy is running locally:
 
-| Layer | Features |
-|-------|----------|
-| **Core** | Multi-listener, TLS, routing, load balancing |
-| **Resilience** | Circuit breakers, health checks, retries |
-| **Scalability** | Rate limiting, service discovery, hot reload |
-| **Observability** | Prometheus metrics, access logs |
+```sh
+# trip the cluster CB (default cluster has max_requests: 50)
+seq 200 | xargs -P 80 -n1 -I_ curl -s -o /dev/null -w "%{http_code}\n" \
+  http://localhost:8080/ | sort | uniq -c
 
----
+# rate limiter (default rps=1000, burst=1000 — bump load to see 429s)
+hey -n 5000 -c 200 http://localhost:8080/ 2>/dev/null | grep -A1 "Status code"
 
-## Further Learning
+# eject + recover an endpoint by killing a backend, then restarting it
+curl -s localhost:9901/endpoints | jq '.[] | {name, endpoints: .endpoints[]?}'
 
-**Related Projects**:
+# hot reload after editing config/dev.yaml
+curl -X POST localhost:9901/reload
+```
 
-- [Envoy Proxy](https://www.envoyproxy.io/)
-- [NGINX](https://nginx.org/)
-- [HAProxy](http://www.haproxy.org/)
-- [Traefik](https://traefik.io/)
+## License
 
-**Resources**:
-
-- [Circuit Breaker Pattern](https://martinfowler.com/bliki/CircuitBreaker.html)
-- [HTTP/1.1 Spec (RFC 7230)](https://tools.ietf.org/html/rfc7230)
-- [TLS 1.3 Spec (RFC 8446)](https://tools.ietf.org/html/rfc8446)
-
----
-
-*Built with ❤️ in Go*
+MIT — see [LICENSE](./LICENSE).
